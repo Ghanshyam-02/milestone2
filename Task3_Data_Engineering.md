@@ -1,25 +1,34 @@
 # Task 3 - Data Engineering & Spark
 
+## What was asked
+
+- Design the Bronze → Silver → Gold processing.
+- Explain how to handle late events, out-of-order events, duplicates, failed records, schema changes and incremental processing.
+- Explain how to investigate a slow Spark job (partitions, shuffle, skew, Spark UI, broadcast join, repartitioning, pre-aggregation).
+- Answer: should we broadcast MERCHANT_RISK, and why?
+
+Our code for this task: `code/pipeline.py` (pandas) and `code/spark_job.py` (Spark), using the sample files in `data/`.
+
 ## Bronze → Silver → Gold
 
-| Layer | What it holds |
-|---|---|
-| Bronze | Raw data exactly as received. Never changed. |
-| Silver | Cleaned data: correct types, no duplicates, bad rows removed. |
-| Gold | Business tables: star schema and summaries for reports and the API. |
+| Layer | What it holds | What we do there |
+|---|---|---|
+| **Bronze** | Raw data exactly as received | Save everything, never change it. Lets us re-run if something goes wrong. |
+| **Silver** | Clean data | Fix types, remove duplicates, order events, move bad rows to quarantine, apply SCD Type 2 |
+| **Gold** | Business data | Star schema and monthly summary for reports and the API |
 
 ## Handling data problems
 
-| Problem | How we handle it |
-|---|---|
-| Late-arriving events | Report using `event_ts` (when it happened), not `ingestion_ts`. Wait 15 minutes for late data (watermark). Very late data is fixed by a nightly job. |
-| Out-of-order events | Sort events by `event_ts`, not by arrival time. |
-| Duplicate events | Keep only one row per `event_id`. |
-| Failed records | Move bad rows to a quarantine table with the reason. |
-| Schema changes | Allow only new optional columns. Keep raw data in Bronze. |
-| Incremental processing | Process only new data using checkpoints and MERGE. |
+| Problem | How we handle it | Example in our sample data |
+|---|---|---|
+| Late-arriving events | Report using `event_ts` (when it happened), not `ingestion_ts` (when it arrived). The stream waits 15 minutes (watermark). Later data is merged by a nightly job. | T002 fraud event happened 10:03, arrived 10:17 (14 min late). T003 settlement happened 31 Aug, arrived 1 Sep. |
+| Out-of-order events | Sort by `event_ts` and number the events per transaction | T001 arrived AUTH → SETTLEMENT → FRAUD, but happened AUTH → FRAUD → SETTLEMENT |
+| Duplicate events | Keep only one row per `event_id` | E010 was sent twice |
+| Failed records | Move bad rows to a quarantine table with the reason. Never delete silently. | e.g. negative amount, missing ID |
+| Schema changes | Allow only new optional columns. Raw data stays in Bronze. | - |
+| Incremental processing | Process only new data using checkpoints and MERGE | - |
 
-**Out-of-order example:**
+**Ordering events by business time:**
 
 ```sql
 SELECT transaction_id, event_type, event_ts,
@@ -29,9 +38,18 @@ FROM payment_event;
 
 ## Problem A - Double counting
 
-Yes, the developer's query **double counts**. If a transaction has 2 settlement rows, the join repeats the payment twice, so `SUM(t.amount)` is doubled.
+The developer's query:
 
-**Fix:** sum the settlements first, then join.
+```sql
+SELECT t.transaction_id, SUM(t.amount), SUM(s.settlement_amount)
+FROM payment_transaction t
+JOIN settlement s ON t.transaction_id = s.transaction_id
+GROUP BY t.transaction_id;
+```
+
+**Yes, it double counts.** One payment can have 2 settlement rows (partial settlement or correction). The join repeats the payment for each settlement row, so `SUM(t.amount)` is counted twice.
+
+**Fix:** sum the settlements per transaction first, then join.
 
 ```sql
 WITH s AS (
@@ -44,25 +62,38 @@ FROM payment_transaction t
 LEFT JOIN s ON s.transaction_id = t.transaction_id;
 ```
 
+**Result on our sample data:** wrong total **18,718.50**, correct total **16,148.50** (T001 and T005 were counted twice).
+
 ## Why is the Spark job slow? How to check
 
-- **Spark UI:** find the slowest stage.
-- **Skew:** if one task takes much longer than the others, one key (such as a big merchant) has too much data.
-- **Shuffle:** joins move data across machines. A large shuffle is slow.
-- **Partitions:** too few gives big slow tasks; too many gives overhead.
-- **Pre-aggregation:** reduce rows (e.g. one row per transaction) before the join.
-- **Repartitioning:** repartition big tables on the join key (`transaction_id`).
+| Step | What to look at |
+|---|---|
+| 1. Spark UI | Open the Stages tab and find the slowest stage |
+| 2. Skew | One task takes much longer than the others, because one key (e.g. a big merchant) has too much data |
+| 3. Shuffle | Joins move data between machines. Big shuffle read/write means slow |
+| 4. Partitions | Too few gives huge tasks; too many gives overhead. Aim for about 128-256 MB each |
+| 5. Pre-aggregation | Reduce rows before joining (e.g. one row per transaction instead of many events) |
+| 6. Repartitioning | Repartition the big tables on the join key (`transaction_id`) |
+| 7. Broadcast join | Copy small tables to every machine (see below) |
 
 ## Should we use a broadcast join?
 
-**Yes, for MERCHANT_RISK.**
+**Yes, for MERCHANT_RISK, but it is not the full fix.**
 
-- It is small (a few thousand rows), so Spark can copy it to every machine.
-- The big PAYMENT_EVENT table then does not need to be shuffled, which saves time.
-- The join must still use `merchant_id =` (plus the date range), otherwise it becomes very slow.
-- It does not fix the big join (PAYMENT_EVENT + PAYMENT_TRANSACTION). That one needs repartitioning and skew handling.
+- **Why yes:** MERCHANT_RISK has only a few thousand rows. Spark can copy it to every machine. Then the millions of PAYMENT_EVENT rows do not need to be shuffled for this join.
+- **Keep an equality key:** join on `merchant_id =` plus the date range. A join on only a date range becomes very slow.
+- **Check the size:** if the table grows very large, broadcasting uses too much memory.
+- **Not the full fix:** the big join (PAYMENT_EVENT + PAYMENT_TRANSACTION) cannot be broadcast. It needs pre-aggregation, repartitioning and skew handling.
 
 ```python
-from pyspark.sql.functions import broadcast
-result = events.join(broadcast(merchant_risk), "merchant_id")
+from pyspark.sql import functions as F
+
+result = payments.join(
+    F.broadcast(risk),
+    (payments.merchant_id == risk.merchant_id)
+    & F.to_date(payments.transaction_ts).between(F.to_date(risk.effective_from), F.to_date(risk.effective_to)),
+    "left",
+)
 ```
+
+**Result of the Spark job** (`code/spark_job.py`): the Spark plan shows `BroadcastHashJoin`, and M100 gets LOW (Feb), HIGH (May) and MEDIUM (Aug).

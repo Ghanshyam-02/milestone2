@@ -1,10 +1,32 @@
 # Task 2 - Physical Data Model
 
+## What was asked
+
+- **A.** A star schema with DIM_CUSTOMER, DIM_MERCHANT, DIM_ACCOUNT, DIM_DATE and FACT_PAYMENT, with primary keys, foreign keys, data types, constraints and partitioning.
+- **B.** How to keep merchant risk history, so a February payment gets the February risk.
+- **C.** A small Data Vault and why it helps the bank with audit and history.
+
 ## A. Star Schema
 
+A star schema has one **fact table** in the middle (the numbers, e.g. amount) and **dimension tables** around it (the details: who, which merchant, which account, which date).
+
 **FACT_PAYMENT grain = one payment transaction attempt.**
+Grain means "what one row stands for". Every payment attempt is exactly one row.
 
 ![Star schema](images/star_schema.png)
+
+| Table | Primary key | Main columns |
+|---|---|---|
+| DIM_DATE | date_key | full_date, year_month |
+| DIM_CUSTOMER | customer_sk | customer_id, country, segment, risk_category |
+| DIM_ACCOUNT | account_sk | account_id, customer_id |
+| DIM_MERCHANT | merchant_sk | merchant_id, risk_category, effective_from, effective_to |
+| FACT_PAYMENT | transaction_id | the 4 foreign keys + amount, currency, status, fraud_decision, risk_score |
+
+**Key words**
+- **Surrogate key (_sk):** a number we create. Needed because merchant M100 has several versions, so `merchant_id` alone is not unique.
+- **Foreign key (FK):** links the fact table to a dimension.
+- **DECIMAL for money:** never FLOAT, because FLOAT causes rounding errors.
 
 ```sql
 CREATE TABLE dim_date (
@@ -52,22 +74,32 @@ CREATE TABLE fact_payment (
 );
 ```
 
-**Partitioning / indexing**
-- `fact_payment` partitioned by month of `transaction_ts`.
-- Sort / cluster by `date_key` and `country` (most queries filter by these).
-- Index on `dim_merchant (merchant_id, effective_from)` for fast lookups.
+**Partitioning and indexing**
 
-## B. Merchant Risk History - SCD Type 2
+| What | Why |
+|---|---|
+| Partition `fact_payment` by month of `transaction_ts` | A monthly report reads only one month, not 7 years |
+| Sort / cluster by `date_key` and `country` | Most queries filter by date and country |
+| Index `dim_merchant (merchant_id, effective_from)` | Fast lookup of the right merchant version |
+| Small dimension tables copied to every node (Redshift `DISTSTYLE ALL`) | Joins stay fast |
 
-We use **SCD Type 2**. When the risk changes, the old row is closed and a new row is added. History is never lost.
+## B. Merchant Risk History
 
-| merchant_sk | merchant_id | risk | effective_from | effective_to |
-|---|---|---|---|---|
-| 1 | M100 | LOW | 2026-01-01 | 2026-03-31 |
-| 2 | M100 | HIGH | 2026-04-01 | 2026-06-30 |
-| 3 | M100 | MEDIUM | 2026-07-01 | 9999-12-31 |
+| Option | What it does | Our choice |
+|---|---|---|
+| SCD Type 1 | Overwrites the old value | No - history is lost, February would show MEDIUM |
+| **SCD Type 2** | Closes the old row and adds a new row | **Yes - used in Gold** |
+| Data Vault | Keeps every change with load time | Yes - used in Silver for audit |
 
-A February transaction joins on the date range, so it gets **LOW** (not MEDIUM):
+With **SCD Type 2**, merchant M100 has 3 rows:
+
+| merchant_sk | merchant_id | risk | effective_from | effective_to | is_current |
+|---|---|---|---|---|---|
+| 1 | M100 | LOW | 2026-01-01 | 2026-03-31 | false |
+| 2 | M100 | HIGH | 2026-04-01 | 2026-06-30 | false |
+| 3 | M100 | MEDIUM | 2026-07-01 | 9999-12-31 | true |
+
+A payment is joined to the row whose date range contains the payment date (a **point-in-time join**):
 
 ```sql
 SELECT t.transaction_id, m.merchant_sk, m.risk_category
@@ -77,7 +109,25 @@ JOIN dim_merchant m
   AND CAST(t.transaction_ts AS DATE) BETWEEN m.effective_from AND m.effective_to;
 ```
 
+**Result on our sample data** (`code/pipeline.py`):
+
+| Transaction | Date | Risk given | Current risk |
+|---|---|---|---|
+| T001 | 14 Feb 2026 | **LOW** | MEDIUM |
+| T002 | 20 May 2026 | **HIGH** | MEDIUM |
+| T004 | 5 Aug 2026 | **MEDIUM** | MEDIUM |
+
+The fact table stores `merchant_sk`, so the February payment stays linked to LOW forever.
+
 ## C. Data Vault
+
+A Data Vault has 3 kinds of table:
+
+| Type | Holds | Our tables |
+|---|---|---|
+| Hub | Only the business key | HUB_CUSTOMER, HUB_MERCHANT, HUB_TRANSACTION |
+| Link | Relationships between hubs | LINK_CUSTOMER_TRANSACTION, LINK_MERCHANT_TRANSACTION |
+| Satellite | Details and their history | SAT_CUSTOMER, SAT_MERCHANT, SAT_TRANSACTION |
 
 ```sql
 CREATE TABLE hub_customer    (customer_hk CHAR(32) PRIMARY KEY, customer_id VARCHAR(20), load_ts TIMESTAMP, record_source VARCHAR(50));
@@ -92,7 +142,13 @@ CREATE TABLE sat_merchant    (merchant_hk CHAR(32), load_ts TIMESTAMP, risk_cate
 CREATE TABLE sat_transaction (transaction_hk CHAR(32), load_ts TIMESTAMP, amount DECIMAL(18,2), status VARCHAR(10), PRIMARY KEY (transaction_hk, load_ts));
 ```
 
+- `_hk` is a hash key (MD5 of the business key).
+- `load_ts` = when the row was loaded. `record_source` = which system it came from.
+
 **Why Data Vault helps the bank**
-- Data is only inserted, never updated, so the full history is kept for audit.
-- Every row has `load_ts` and `record_source`, so we know when and where it came from.
-- Old reports can be rebuilt exactly as they were.
+- **Nothing is overwritten.** Rows are only inserted, so the full history is always there for auditors.
+- **We know where data came from.** Every row has `load_ts` and `record_source` (on-prem or AWS).
+- **Old reports can be rebuilt** exactly as they were on any date.
+- **Easy to add new sources** without changing existing tables.
+
+The downside is that it has many tables and is hard to query, so business users use the Gold star schema instead.

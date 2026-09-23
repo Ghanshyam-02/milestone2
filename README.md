@@ -31,3 +31,6 @@ python code/spark_job.py
 cd code && uvicorn api:app --reload
 ```
 
+## Explanation scripts (not for submission)
+
+`_NOT_FOR_SUBMISSION/Task1_script.md` ... `Task7_script.md` - one script per task to read out loud: what was asked, the theory, and what we did.
