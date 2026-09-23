@@ -1,0 +1,6 @@
+customer_id,country,segment,risk_category
+C001,IN,Retail,LOW
+C002,IN,Premium,LOW
+C003,IN,Retail,MEDIUM
+C004,GB,SME,LOW
+C005,IN,Retail,HIGH
